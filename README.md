@@ -1,6 +1,6 @@
 # codex-register-py
 
-基于 Python 的 HTTP 自动化脚本，通过接口执行账号注册/登录相关步骤，并通过 MailAPI 轮询邮箱验证码。
+基于 Python 的 HTTP 自动化脚本，通过接口执行账号注册/登录相关步骤，并通过 MailAPI 轮询邮箱验证码，注册完成后自动上传到CPA（如果有配置的话）。
 项目参考：https://github.com/Ethan-W20/openai-auto-register
 
 ## 免责声明
