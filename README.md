@@ -103,6 +103,7 @@ python codex_register.py --count 20 --workers 5
 - 以 UTC 日期 (`YYYY-MM-DD`) 作为缓存时间标记。
 - 若缓存中的 `date` 与当前日期不一致，会先删除旧 `proxy_cache.json`，再重建当天缓存。
 - 个人代理池构建脚本就不上传到仓库了，如果没有合适的代理，可用使用本人的另一个项目（[warp-proxy-docker](https://github.com/kschen202115/warp-proxy-docker)）
+- 上面那个仓库有问题，酌情使用，或者使用这个仓库的公共代理[PROXY-List](https://github.com/TheSpeedX/PROXY-List)
 
 `proxy_cache.json`内结构如下
 ```bash
