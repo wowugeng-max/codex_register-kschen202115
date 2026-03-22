@@ -652,88 +652,248 @@ def register_account(
             log.info(f"      OK")
             _sleep(0.5, 1.5)
 
-        # --- 8. 选择 Workspace ---
-        auth_cookie = http.get_cookie("oai-client-auth-session")
-        if not auth_cookie:
-            raise RuntimeError("未获取到 oai-client-auth-session cookie")
+        # 判断是否需要重新登录
+        needs_relogin = not is_existing_account and not is_login
 
-        # 解析 cookie 获取 workspace_id
+        if not needs_relogin:
+            # 已注册账号或登录模式，直接在当前会话拿 token
+            return _complete_token_exchange(http, oauth, email_addr, name, mode_label,
+                                            mode, _check_cancel, _sleep)
+
+    # ═══════════════════════════════════════════════════════
+    # 新注册账号：重新发起登录流程拿 token
+    # 注册完成后的会话状态不完整，需要重新走一遍完整登录才能拿到干净的 token set
+    # ═══════════════════════════════════════════════════════
+    log.info(f"  [7.5] 注册完成，重新发起登录流程拿 token...")
+    _sleep(1.0, 2.0)
+
+    with APISession(proxy) as http2:
+        # --- 7.5a. 重新 OAuth ---
+        _check_cancel()
+        oauth = create_oauth_params()
+        log.info(f"  [7.5a] 重新发起 OAuth (登录)...")
+        resp2 = http2.get(oauth["auth_url"])
+        log.info(f"         状态: {resp2.status}")
+
+        device_id2 = http2.get_cookie("oai-did") or ""
+        if device_id2:
+            log.info(f"         设备ID: {device_id2[:16]}...")
+
+        _sleep(0.8, 2.0)
+
+        # --- 7.5b. 重新 Sentinel PoW ---
+        _check_cancel()
+        log.info(f"  [7.5b] 重新求解 Sentinel PoW...")
+        ua2 = http2._session.headers.get("User-Agent", "Mozilla/5.0")
         try:
-            cookie_b64 = auth_cookie.split(".")[0]
-            padding = "=" * ((4 - len(cookie_b64) % 4) % 4)
-            cookie_data = json.loads(base64.b64decode(cookie_b64 + padding))
-            workspaces = cookie_data.get("workspaces", [])
-            workspace_id = workspaces[0]["id"] if workspaces else None
-        except Exception as e:
-            raise RuntimeError(f"解析 workspace 失败: {e}")
+            pow_token2 = build_sentinel_pow_token(ua2)
+        except SentinelPOWError as e:
+            raise RuntimeError(f"重新登录 Sentinel PoW 求解失败: {e}")
 
-        if not workspace_id:
-            raise RuntimeError("未找到 workspace_id")
-
-        log.info(f"  [8] 选择 Workspace: {workspace_id[:20]}...")
-        select_resp = http.post_json(
-            OAI_WORKSPACE_URL,
-            {"workspace_id": workspace_id},
-            headers={"Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"},
+        sentinel_body2 = json.dumps({
+            "p": pow_token2,
+            "id": device_id2,
+            "flow": "authorize_continue",
+        }, separators=(",", ":"))
+        sentinel_resp2 = http2._session.post(
+            OAI_SENTINEL_URL,
+            data=sentinel_body2,
+            headers={
+                "Origin": "https://sentinel.openai.com",
+                "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+                "Content-Type": "text/plain;charset=UTF-8",
+            },
+            timeout=30,
         )
-        if not select_resp.ok():
-            raise RuntimeError(f"选择 workspace 失败: {select_resp.status}")
-
-        continue_url = select_resp.json().get("continue_url")
-        if not continue_url:
-            raise RuntimeError("未获取到 continue_url")
-
-        # --- 9. 跟随重定向，获取回调并兑换 token ---
-        log.info(f"  [9] 跟随重定向获取 Token...")
-        callback_url = http.follow_redirects(continue_url)
-        if not callback_url:
-            raise RuntimeError("重定向失败，未获取到回调 URL")
-
-        # 解析回调 URL 中的 code
-        parsed = urllib.parse.urlparse(callback_url)
-        query = urllib.parse.parse_qs(parsed.query)
-        auth_code = query.get("code", [""])[0]
-        returned_state = query.get("state", [""])[0]
-
-        if not auth_code:
-            raise RuntimeError("回调 URL 缺少 code")
-        if returned_state != oauth["state"]:
-            raise RuntimeError("State 不匹配")
-
-        # 兑换 token
-        token_resp = http.post_form(OAI_TOKEN_URL, {
-            "grant_type": "authorization_code",
-            "client_id": OAI_CLIENT_ID,
-            "code": auth_code,
-            "redirect_uri": LOCAL_REDIRECT_URI,
-            "code_verifier": oauth["verifier"],
+        if sentinel_resp2.status_code < 200 or sentinel_resp2.status_code >= 300:
+            raise RuntimeError(f"重新登录 Sentinel 失败: {sentinel_resp2.status_code}")
+        sentinel_token2 = sentinel_resp2.json()["token"]
+        sentinel_header2 = json.dumps({
+            "p": "", "t": "", "c": sentinel_token2,
+            "id": device_id2, "flow": "authorize_continue",
         })
-        if not token_resp.ok():
-            raise RuntimeError(f"Token 兑换失败: {token_resp.status} {token_resp.text[:300]}")
+        log.info(f"         Sentinel token OK")
 
-        token_data = token_resp.json()
+        _sleep(0.5, 1.5)
 
-        # 解析 id_token 获取额外信息
-        claims = decode_jwt_payload(token_data.get("id_token", ""))
-        auth_claims = claims.get("https://api.openai.com/auth", {})
+        # --- 7.5c. 提交邮箱（登录模式）---
+        _check_cancel()
+        log.info(f"  [7.5c] 提交邮箱 (登录): {email_addr}")
+        login_resp = http2.post_json(
+            OAI_SIGNUP_URL,
+            {"username": {"value": email_addr, "kind": "email"}, "screen_hint": "login"},
+            headers={
+                "Referer": "https://auth.openai.com/log-in",
+                "openai-sentinel-token": sentinel_header2,
+            },
+        )
+        if not login_resp.ok():
+            raise RuntimeError(f"重新登录提交邮箱失败: {login_resp.status} {login_resp.text[:300]}")
 
-        now = int(time.time())
-        result = {
-            "email": email_addr,
-            "type": "codex",
-            "name": name or claims.get("name", ""),
-            "access_token": token_data.get("access_token", ""),
-            "refresh_token": token_data.get("refresh_token", ""),
-            "id_token": token_data.get("id_token", ""),
-            "account_id": auth_claims.get("chatgpt_account_id", ""),
-            "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                time.gmtime(now + int(token_data.get("expires_in", 0)))),
-            "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-            "mode": mode,
-        }
+        login_page_type = ""
+        try:
+            login_page_type = login_resp.json().get("page", {}).get("type", "")
+        except Exception:
+            pass
+        log.info(f"         页面类型: {login_page_type}")
 
-        log.info(f"  🎉 {mode_label}成功！")
-        return result
+        if login_page_type != "login_password":
+            raise RuntimeError(f"重新登录未进入密码页面: {login_page_type or 'unknown'}")
+
+        _sleep(0.5, 1.5)
+
+        # --- 7.5d. 提交密码 ---
+        OAI_PASSWORD_VERIFY_URL = "https://auth.openai.com/api/accounts/password/verify"
+        _check_cancel()
+        log.info(f"  [7.5d] 提交登录密码...")
+        pwd_resp = http2.post_json(
+            OAI_PASSWORD_VERIFY_URL,
+            {"password": password},
+            headers={"Referer": "https://auth.openai.com/log-in/password"},
+        )
+        if not pwd_resp.ok():
+            raise RuntimeError(f"重新登录提交密码失败: {pwd_resp.status} {pwd_resp.text[:300]}")
+
+        pwd_page_type = ""
+        try:
+            pwd_page_type = pwd_resp.json().get("page", {}).get("type", "")
+        except Exception:
+            pass
+        log.info(f"         页面类型: {pwd_page_type}")
+
+        if pwd_page_type != "email_otp_verification":
+            raise RuntimeError(f"重新登录未进入验证码页面: {pwd_page_type or 'unknown'}")
+
+        otp_sent_at = time.time()
+        log.info(f"         密码校验通过，等待验证码...")
+
+        _sleep(0.5, 1.5)
+
+        # --- 7.5e. 获取并验证登录 OTP ---
+        def _resend2():
+            r = http2.post_json(OAI_RESEND_OTP_URL, {},
+                headers={"Referer": "https://auth.openai.com/email-verification"})
+            return r.ok()
+
+        code2 = poll_verification_code(
+            mail_account, mail_api,
+            used_codes=codes,
+            resend_fn=_resend2,
+            otp_sent_at=otp_sent_at,
+            cancel_fn=cancel_fn,
+        )
+
+        _check_cancel()
+        log.info(f"  [7.5f] 验证登录 OTP: {code2}")
+        verify_resp2 = http2.post_json(
+            OAI_VERIFY_OTP_URL, {"code": code2},
+            headers={"Referer": "https://auth.openai.com/email-verification"},
+        )
+        if not verify_resp2.ok():
+            raise RuntimeError(f"重新登录 OTP 验证失败: {verify_resp2.status} {verify_resp2.text[:300]}")
+        log.info(f"         OK")
+
+        _sleep(0.5, 1.5)
+
+        # 使用新会话完成 token 兑换
+        return _complete_token_exchange(http2, oauth, email_addr, name, "注册+登录",
+                                        "login", _check_cancel, _sleep)
+
+
+def _complete_token_exchange(
+    http: "APISession",
+    oauth: dict,
+    email_addr: str,
+    name: str,
+    mode_label: str,
+    mode: str,
+    _check_cancel,
+    _sleep,
+) -> dict:
+    """从当前会话中完成 workspace 选择 + 重定向 + token 兑换"""
+
+    # --- 8. 选择 Workspace ---
+    auth_cookie = http.get_cookie("oai-client-auth-session")
+    if not auth_cookie:
+        raise RuntimeError("未获取到 oai-client-auth-session cookie")
+
+    # 解析 cookie 获取 workspace_id
+    try:
+        cookie_b64 = auth_cookie.split(".")[0]
+        padding = "=" * ((4 - len(cookie_b64) % 4) % 4)
+        cookie_data = json.loads(base64.b64decode(cookie_b64 + padding))
+        workspaces = cookie_data.get("workspaces", [])
+        workspace_id = workspaces[0]["id"] if workspaces else None
+    except Exception as e:
+        raise RuntimeError(f"解析 workspace 失败: {e}")
+
+    if not workspace_id:
+        raise RuntimeError("未找到 workspace_id")
+
+    log.info(f"  [8] 选择 Workspace: {workspace_id[:20]}...")
+    select_resp = http.post_json(
+        OAI_WORKSPACE_URL,
+        {"workspace_id": workspace_id},
+        headers={"Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"},
+    )
+    if not select_resp.ok():
+        raise RuntimeError(f"选择 workspace 失败: {select_resp.status}")
+
+    continue_url = select_resp.json().get("continue_url")
+    if not continue_url:
+        raise RuntimeError("未获取到 continue_url")
+
+    # --- 9. 跟随重定向，获取回调并兑换 token ---
+    log.info(f"  [9] 跟随重定向获取 Token...")
+    callback_url = http.follow_redirects(continue_url)
+    if not callback_url:
+        raise RuntimeError("重定向失败，未获取到回调 URL")
+
+    # 解析回调 URL 中的 code
+    parsed = urllib.parse.urlparse(callback_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    auth_code = query.get("code", [""])[0]
+    returned_state = query.get("state", [""])[0]
+
+    if not auth_code:
+        raise RuntimeError("回调 URL 缺少 code")
+    if returned_state != oauth["state"]:
+        raise RuntimeError("State 不匹配")
+
+    # 兑换 token
+    token_resp = http.post_form(OAI_TOKEN_URL, {
+        "grant_type": "authorization_code",
+        "client_id": OAI_CLIENT_ID,
+        "code": auth_code,
+        "redirect_uri": LOCAL_REDIRECT_URI,
+        "code_verifier": oauth["verifier"],
+    })
+    if not token_resp.ok():
+        raise RuntimeError(f"Token 兑换失败: {token_resp.status} {token_resp.text[:300]}")
+
+    token_data = token_resp.json()
+
+    # 解析 id_token 获取额外信息
+    claims = decode_jwt_payload(token_data.get("id_token", ""))
+    auth_claims = claims.get("https://api.openai.com/auth", {})
+
+    now = int(time.time())
+    result = {
+        "email": email_addr,
+        "type": "codex",
+        "name": name or claims.get("name", ""),
+        "access_token": token_data.get("access_token", ""),
+        "refresh_token": token_data.get("refresh_token", ""),
+        "id_token": token_data.get("id_token", ""),
+        "account_id": auth_claims.get("chatgpt_account_id", ""),
+        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(now + int(token_data.get("expires_in", 0)))),
+        "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "mode": mode,
+    }
+
+    log.info(f"  🎉 {mode_label}成功！")
+    return result
 
 
 # ═══════════════════════════════════════════════════════
